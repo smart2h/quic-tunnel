@@ -1,0 +1,18 @@
+[app]
+server_mode = false
+
+bind_ip = "127.0.0.1"
+bind_port = 8080
+
+peer_ip = ""
+peer_port = 8080
+
+[quic]
+idle_timeout = 3600 # seconds
+
+[log]
+file = "/dev/stdout"
+level = "info"
+flush_level = "info"
+# max_size = 20 # MB
+# max_files = 5

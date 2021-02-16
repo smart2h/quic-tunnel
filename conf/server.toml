@@ -1,0 +1,22 @@
+[app]
+server_mode = true
+
+bind_ip = "0.0.0.0"
+bind_port = 8080
+
+peer_ip = "127.0.0.1"
+peer_port = 8080
+
+[quic]
+idle_timeout = 3600 # seconds
+
+# absolute path, or relative path to this file
+cert_chain_path = "cert.crt"
+private_key_path = "cert.key"
+
+[log]
+file = "/dev/stdout"
+level = "info"
+flush_level = "info"
+# max_size = 20 # MB
+# max_files = 5
