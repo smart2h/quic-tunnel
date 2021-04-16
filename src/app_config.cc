@@ -85,12 +85,20 @@ int AppConfig::Load(const std::string &path) {
       cfg.key_path = toml::find<std::string>(quic, "private_key_path");
       if (!ResolvePath(path, cfg.cert_path) ||
           !ResolvePath(path, cfg.key_path)) {
+        logger->error("invalid cert_chain_path or private_key_path");
         return -1;
       }
+    } else {
+      cfg.initial_max_streams_bidi = 0;
     }
 
     const auto &log = toml::find(table, "log");
     cfg.log_file = toml::find<std::string>(log, "file");
+    if (!ResolvePath(path, cfg.log_file)) {
+      logger->error("invalid log file");
+      return -1;
+    }
+
     cfg.log_level = toml::find_or<std::string>(log, "level", "info");
     cfg.flush_level = toml::find_or<std::string>(log, "flush_level", "warn");
     cfg.log_pattern = toml::find_or<std::string>(log, "pattern", "");

@@ -1,5 +1,7 @@
 #include "quic/quic_client.h"
 
+#include <spdlog/fmt/bin_to_hex.h>
+
 #include <memory>
 
 #include "app_config.h"
@@ -83,6 +85,18 @@ void QuicClient::ReadCallback(int fd, short, void *arg) {
     }
 
     logger->trace("UDP recv {} bytes", count);
+
+    QuicHeader header;
+    if (auto r = QuicHeader::Parse(udp_buffer, count, header); r < 0) {
+      logger->warn("failed to parse header: {}", r);
+      continue;
+    }
+
+    if (header.dcid != client->connection_->id()) {
+      logger->warn("invalid cid {:spn}", spdlog::to_hex(header.dcid));
+      continue;
+    }
+
     client->connection_->OnRead(udp_buffer, count, sizeof(udp_buffer));
   }
 }

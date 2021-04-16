@@ -1,13 +1,8 @@
 #include "tcp_tunnel_client.h"
 
 #include <event2/bufferevent.h>
-#include <spdlog/fmt/bin_to_hex.h>
 
 namespace quic_tunnel {
-
-auto TcpTunnelClient::HexId() {
-  return spdlog::to_hex(quic_client_.connection().id());
-}
 
 int TcpTunnelClient::Bind(const AppConfig &cfg, EventBase &base) {
   if (quic_client_.Connect() != 0) {
@@ -27,11 +22,6 @@ int TcpTunnelClient::Bind(const AppConfig &cfg, EventBase &base) {
   return 0;
 }
 
-bufferevent *TcpTunnelClient::OnNewStream(StreamId stream_id) {
-  logger->error("unknown stream {}, cid {:spn}", stream_id, HexId());
-  return nullptr;
-}
-
 TcpTunnelCallbacks::Status TcpTunnelClient::OnTcpRead() {
   if (quic_client_.connection().IsEstablished()) {
     return TcpTunnelCallbacks::Status::kReady;
@@ -40,15 +30,20 @@ TcpTunnelCallbacks::Status TcpTunnelClient::OnTcpRead() {
   if (quic_client_.connection().IsClosed()) {
     quic_client_.Connect();
   }
-
-  logger->info("waiting for connected, waiting queue {}, cid {:spn}",
-               StreamNum(), HexId());
   return TcpTunnelCallbacks::Status::kUnready;
 }
 
 void TcpTunnelClient::AcceptCallback(evconnlistener *listener,
                                      evutil_socket_t fd, sockaddr *, int,
                                      void *ctx) {
+  auto client = static_cast<TcpTunnelClient *>(ctx);
+  if (client->IsEstablished() &&
+      client->quic_client_.connection().PeerStreamsLeft() == 0) {
+    logger->warn("no peer streams left");
+    evutil_closesocket(fd);
+    return;
+  }
+
   auto base = evconnlistener_get_base(listener);
   bufferevent *bev = bufferevent_socket_new(
       base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
@@ -65,21 +60,7 @@ void TcpTunnelClient::AcceptCallback(evconnlistener *listener,
     logger->error("failed to enable buffer event");
     bufferevent_free(bev);
     evutil_closesocket(fd);
-    return;
   }
-
-  auto client = static_cast<TcpTunnelClient *>(ctx);
-  client->NewStream(bev);
-}
-
-void TcpTunnelClient::OnConnected(Connection &) {
-  logger->info("connected, waiting queue {}, cid {:spn}", StreamNum(), HexId());
-  FlushTcpToQuic();
-}
-
-void TcpTunnelClient::NewStream(bufferevent *bev) {
-  const auto stream_id = stream_id_generator_.Next();
-  TcpTunnelCallbacks::NewStream(stream_id, bev);
 }
 
 }  // namespace quic_tunnel

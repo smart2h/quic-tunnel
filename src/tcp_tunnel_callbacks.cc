@@ -1,62 +1,64 @@
 #include "tcp_tunnel_callbacks.h"
 
 #include <event2/buffer.h>
+#include <event2/bufferevent.h>
 #include <spdlog/fmt/bin_to_hex.h>
+
+#include <tuple>
+#include <utility>
 
 namespace quic_tunnel {
 
 auto TcpTunnelCallbacks::HexId() { return spdlog::to_hex(connection().id()); }
 
+void TcpTunnelCallbacks::OnConnected(Connection &connection) {
+  connection_ = &connection;
+  for (auto bev : waiting_bevs_) {
+    bufferevent_enable(bev, EV_READ);
+    ReadCallback(bev, this);
+  }
+  waiting_bevs_.clear();
+}
+
 void TcpTunnelCallbacks::OnClosed() {
-  if (!bev_to_stream_id_.empty()) {
+  if (!bev_to_stream_callbacks_.empty()) {
     logger->info(
         "closing {} application connections since QUIC connection {:spn} "
         "closed",
-        bev_to_stream_id_.size(), HexId());
-    for (auto iter = bev_to_stream_id_.cbegin();
-         iter != bev_to_stream_id_.cend();) {
+        bev_to_stream_callbacks_.size(), HexId());
+    for (auto iter = bev_to_stream_callbacks_.cbegin();
+         iter != bev_to_stream_callbacks_.cend();) {
       auto *bev = iter->first;
       ++iter;
       CloseOnTcpWriteFinished(bev);
     }
   }
-  OnQuicConnectionClosed();
+
+  waiting_bevs_.clear();
+  unwritable_streams_.clear();
+  stream_id_generator_.Reset();
+  connection_ = nullptr;
 }
 
 void TcpTunnelCallbacks::OnStreamRead(StreamId stream_id, const uint8_t *buf,
                                       size_t len, bool finished) {
-  bufferevent *bev;
-  if (auto iter = stream_id_to_bev_.find(stream_id);
-      iter == stream_id_to_bev_.end()) {
+  if (auto iter = stream_id_to_stream_callbacks_.find(stream_id);
+      iter == stream_id_to_stream_callbacks_.end()) {
     if (finished && len == 0) {
-      logger->debug(
-          "closed stream {} recv 0-byte fin frame, ignore it, cid {:spn}",
-          stream_id, HexId());
-      return;
-    }
-
-    bev = OnNewStream(stream_id);
-    if (!bev) {
+      logger->error("stream {} recv 0-byte fin frame, cid {:spn}", stream_id,
+                    HexId());
       connection().Close(stream_id);
       return;
     }
-  } else {
-    bev = iter->second;
-  }
 
-  if (len > 0) {
-    auto *evb = bufferevent_get_output(bev);
-    // TODO if length > ... disable stream read
-    if (evbuffer_add(evb, buf, len) != 0) {
-      logger->error("failed to add event buffer");
-      CloseOnTcpWriteFinished(bev);
+    auto *bev = OnNewStream();
+    if (!bev) {
+      connection().Close(stream_id);
+    } else {
+      NewStream(stream_id, bev).OnStreamRead(buf, len, finished);
     }
-    logger->trace("TCP write buffer {} bytes", evbuffer_get_length(evb));
-  }
-
-  if (finished) {
-    logger->info("remote close stream {}, cid {:spn}", stream_id, HexId());
-    CloseOnTcpWriteFinished(bev);
+  } else {
+    iter->second.OnStreamRead(buf, len, finished);
   }
 }
 
@@ -68,13 +70,12 @@ void TcpTunnelCallbacks::OnStreamWrite(StreamId stream_id) {
     unwritable_streams_.erase(iter);
   }
 
-  const auto iter = stream_id_to_bev_.find(stream_id);
-  if (iter == stream_id_to_bev_.end()) {
+  if (const auto iter = stream_id_to_stream_callbacks_.find(stream_id);
+      iter == stream_id_to_stream_callbacks_.end()) {
     logger->warn("not found writable stream {}, cid {:spn}", stream_id,
                  HexId());
   } else {
-    bufferevent_enable(iter->second, EV_READ);
-    ReadCallback(iter->second, this);
+    iter->second.OnStreamWrite();
   }
 }
 
@@ -88,58 +89,35 @@ void TcpTunnelCallbacks::ReadCallback(bufferevent *bev, void *ctx) {
 
   auto *callbacks = static_cast<TcpTunnelCallbacks *>(ctx);
   if (auto status = callbacks->OnTcpRead(); status == Status::kUnready) {
+    callbacks->waiting_bevs_.emplace(bev);
+    bufferevent_disable(bev, EV_READ);
+    logger->info("waiting for connected, waiting queue {}",
+                 callbacks->waiting_bevs_.size());
     return;
   } else if (status == Status::kClosed) {
     callbacks->CloseOnTcpWriteFinished(bev);
     return;
   }
 
-  const auto iter = callbacks->bev_to_stream_id_.find(bev);
-  if (iter == callbacks->bev_to_stream_id_.end()) {
-    logger->info("ignore closed buffer event");
-    return;
+  if (const auto iter = callbacks->bev_to_stream_callbacks_.find(bev);
+      iter == callbacks->bev_to_stream_callbacks_.end()) {
+    if (callbacks->connection().PeerStreamsLeft() == 0) {
+      logger->warn("no peer streams left");
+      callbacks->Close(bev);
+    } else {
+      auto stream_id = callbacks->stream_id_generator_.Next();
+      callbacks->NewStream(stream_id, bev).OnTcpRead();
+    }
+  } else {
+    iter->second.OnTcpRead();
   }
-
-  evbuffer_ptr ptr;
-  evbuffer_ptr_set(evb, &ptr, 0, EVBUFFER_PTR_SET);
-  evbuffer_iovec vec;
-  size_t total_sent{};
-  while (evbuffer_peek(evb, -1, &ptr, &vec, 1) == 1) {
-    auto sent = callbacks->connection().Send(
-        iter->second, static_cast<const uint8_t *>(vec.iov_base), vec.iov_len,
-        false);  // TODO do not flush every time
-    if (sent < 0) {
-      callbacks->CloseOnTcpWriteFinished(bev);
-      break;
-    }
-
-    total_sent += sent;
-    if (sent < static_cast<int>(vec.iov_len)) {
-      callbacks->unwritable_streams_.emplace(iter->second);
-      bufferevent_disable(bev, EV_READ);
-      logger->trace(
-          "stream {} send buffer is full, remaining {} bytes, total unwritable "
-          "streams {}",
-          iter->second, length - total_sent,
-          callbacks->unwritable_streams_.size());
-      break;
-    }
-
-    if (evbuffer_ptr_set(evb, &ptr, vec.iov_len, EVBUFFER_PTR_ADD) != 0) {
-      logger->error("evbuffer_ptr_set failed");
-      break;
-    }
-  }
-  evbuffer_drain(evb, total_sent);
-  logger->trace("TCP->QUIC {} bytes, remaining {} bytes", total_sent,
-                length - total_sent);
 }
 
-void TcpTunnelCallbacks::WriteCallback(bufferevent *bev, void *ctx) {
+void TcpTunnelCallbacks::WriteCallback(bufferevent *bev, void *) {
   auto *evb = bufferevent_get_output(bev);
   if (evbuffer_get_length(evb) == 0) {
     logger->debug("TCP write finished");
-    static_cast<TcpTunnelCallbacks *>(ctx)->Close(bev);
+    bufferevent_free(bev);
   }
 }
 
@@ -153,72 +131,68 @@ void TcpTunnelCallbacks::EventCallback(bufferevent *bev, short what,
   if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
     callbacks->CloseOnStreamWriteFinished(bev);
   } else if (what & BEV_EVENT_CONNECTED) {
-    const auto iter = callbacks->bev_to_stream_id_.find(bev);
+    const auto iter = callbacks->bev_to_stream_callbacks_.find(bev);
     logger->info("TCP connection established for stream {}, cid {:spn}",
-                 iter == callbacks->bev_to_stream_id_.end() ? 0 : iter->second,
+                 iter == callbacks->bev_to_stream_callbacks_.end()
+                     ? 0
+                     : iter->second.stream_id(),
                  callbacks->HexId());
   } else {
     logger->warn("unknown events: {}", static_cast<int>(what));
   }
 }
 
-void TcpTunnelCallbacks::NewStream(StreamId stream_id, bufferevent *bev) {
-  assert(stream_id_to_bev_.find(stream_id) == stream_id_to_bev_.end());
-  assert(bev_to_stream_id_.find(bev) == bev_to_stream_id_.end());
-  stream_id_to_bev_[stream_id] = bev;
-  bev_to_stream_id_[bev] = stream_id;
-  logger->info("new stream {}, total streams {}, cid {:spn}", stream_id,
-               stream_id_to_bev_.size(), HexId());
+TcpTunnelCallbacks::StreamCallbacks &TcpTunnelCallbacks::NewStream(
+    StreamId stream_id, bufferevent *bev) {
+  assert(stream_id_to_stream_callbacks_.find(stream_id) ==
+         stream_id_to_stream_callbacks_.end());
+  assert(bev_to_stream_callbacks_.find(bev) == bev_to_stream_callbacks_.end());
+
+  auto pair = bev_to_stream_callbacks_.emplace(
+      std::piecewise_construct, std::forward_as_tuple(bev),
+      std::forward_as_tuple(*this, stream_id, bev));
+  stream_id_to_stream_callbacks_.emplace(stream_id, pair.first->second);
+  logger->info(
+      "new stream {}, total streams {}, peer streams left {}, cid {:spn}",
+      stream_id, bev_to_stream_callbacks_.size(),
+      connection().PeerStreamsLeft(), HexId());
+  return pair.first->second;
 }
 
-void TcpTunnelCallbacks::FlushTcpToQuic() {
-  assert(IsEstablished());
-  for (const auto [bev, _] : bev_to_stream_id_) {
-    ReadCallback(bev, this);
+void TcpTunnelCallbacks::Close(bufferevent *bev, bool close_bev) {
+  if (close_bev) {
+    bufferevent_free(bev);
   }
-}
 
-bufferevent *TcpTunnelCallbacks::CloseStream(StreamId stream_id) {
-  if (const auto iter = stream_id_to_bev_.find(stream_id);
-      iter == stream_id_to_bev_.end()) {
-    logger->error("not found stream {}, cid {:spn}", stream_id, HexId());
-    return nullptr;
+  if (const auto iter = bev_to_stream_callbacks_.find(bev);
+      iter == bev_to_stream_callbacks_.end()) {
+    logger->info("TCP connection closed without sending data");
   } else {
-    logger->info("close stream {}, cid {:spn}", stream_id, HexId());
-    stream_id_to_bev_.erase(iter);
-    if (IsEstablished()) {
-      connection().Close(stream_id);
+    iter->second.Close();
+    auto stream_id = iter->second.stream_id();
+    if (const auto it = stream_id_to_stream_callbacks_.find(stream_id);
+        it == stream_id_to_stream_callbacks_.end()) {
+      logger->error("not found stream {}, cid {:spn}", stream_id, HexId());
+    } else {
+      stream_id_to_stream_callbacks_.erase(it);
     }
-    return iter->second;
-  }
-}
-
-StreamId TcpTunnelCallbacks::CloseBufferEvent(bufferevent *bev) {
-  bufferevent_free(bev);
-  if (const auto iter = bev_to_stream_id_.find(bev);
-      iter == bev_to_stream_id_.end()) {
-    logger->error("not found buffer event");
-    return 0;
-  } else {
-    logger->info("close buffer event for stream {}, cid {:spn}", iter->second,
-                 HexId());
-    bev_to_stream_id_.erase(iter);
-    return iter->second;
-  }
-}
-
-void TcpTunnelCallbacks::Close(bufferevent *bev) {
-  auto stream_id = CloseBufferEvent(bev);
-  if (stream_id > 0) {
-    CloseStream(stream_id);
+    bev_to_stream_callbacks_.erase(iter);
   }
 }
 
 void TcpTunnelCallbacks::CloseOnTcpWriteFinished(bufferevent *bev) {
-  if (evbuffer_get_length(bufferevent_get_output(bev)) == 0) {
-    Close(bev);
-  } else {
+  bool tcp_write_finished =
+      evbuffer_get_length(bufferevent_get_output(bev)) == 0;
+  Close(bev, tcp_write_finished);
+
+  if (!tcp_write_finished) {
     bufferevent_disable(bev, EV_READ);
+    auto *evb = bufferevent_get_input(bev);
+    auto len = evbuffer_get_length(evb);
+    if (len > 0) {
+      evbuffer_drain(evb, len);
+      logger->warn("discard TCP input {} bytes", len);
+    }
     bufferevent_setcb(bev, nullptr, WriteCallback, EventCallback, this);
   }
 }
@@ -226,15 +200,109 @@ void TcpTunnelCallbacks::CloseOnTcpWriteFinished(bufferevent *bev) {
 void TcpTunnelCallbacks::CloseOnStreamWriteFinished(bufferevent *bev) {
   ReadCallback(bev, this);
   if (evbuffer_get_length(bufferevent_get_input(bev)) > 0) {
-    logger->warn("stream write unfinished");  // TODO optimize out
+    if (const auto iter = bev_to_stream_callbacks_.find(bev);
+        iter != bev_to_stream_callbacks_.end()) {
+      iter->second.set_tcp_closed();
+      auto *evb = bufferevent_get_output(bev);
+      auto len = evbuffer_get_length(evb);
+      if (len > 0) {
+        evbuffer_drain(evb, len);
+        logger->warn("discard TCP output {} bytes", len);
+      }
+    }
+  } else {
+    Close(bev);
+  }
+}
+
+void TcpTunnelCallbacks::StreamCallbacks::OnStreamRead(const uint8_t *buf,
+                                                       size_t len,
+                                                       bool finished) {
+  if (len > 0) {
+    recv_bytes_ += len;
+    if (tcp_closed_) {
+      logger->error("TCP already closed, stream {} cid {:spn}", stream_id_,
+                    tcp_tunnel_callbacks_.HexId());
+    } else {
+      auto *evb = bufferevent_get_output(bev_);
+      // TODO if length > ... disable stream read
+      if (evbuffer_add(evb, buf, len) != 0) {
+        logger->error("failed to add event buffer");
+        tcp_tunnel_callbacks_.CloseOnTcpWriteFinished(bev_);
+      }
+      logger->trace("TCP write buffer {} bytes", evbuffer_get_length(evb));
+    }
   }
 
-  if (IsEstablished()) {
-    const auto iter = bev_to_stream_id_.find(bev);
-    assert(iter != bev_to_stream_id_.end());
-    logger->info("finish stream {} since TCP connection closed", iter->second);
+  if (finished) {
+    logger->info("remote close stream {}, cid {:spn}", stream_id_,
+                 tcp_tunnel_callbacks_.HexId());
+    tcp_tunnel_callbacks_.CloseOnTcpWriteFinished(bev_);
   }
-  Close(bev);
+}
+
+void TcpTunnelCallbacks::StreamCallbacks::OnStreamWrite() {
+  bufferevent_enable(bev_, EV_READ);
+  OnTcpRead();
+
+  if (tcp_closed_ && evbuffer_get_length(bufferevent_get_input(bev_)) == 0) {
+    logger->debug("stream write finished");
+    tcp_tunnel_callbacks_.Close(bev_);
+  }
+}
+
+void TcpTunnelCallbacks::StreamCallbacks::OnTcpRead() {
+  auto *evb = bufferevent_get_input(bev_);
+  const auto length = evbuffer_get_length(evb);
+  evbuffer_ptr ptr;
+  evbuffer_ptr_set(evb, &ptr, 0, EVBUFFER_PTR_SET);
+  evbuffer_iovec vec;
+  size_t total_sent{};
+  while (evbuffer_peek(evb, -1, &ptr, &vec, 1) == 1) {
+    auto sent = tcp_tunnel_callbacks_.connection().Send(
+        stream_id_, static_cast<const uint8_t *>(vec.iov_base), vec.iov_len,
+        false);  // TODO do not flush every time
+    if (sent < 0) {
+      tcp_tunnel_callbacks_.CloseOnTcpWriteFinished(bev_);
+      break;
+    }
+
+    total_sent += sent;
+    if (sent < static_cast<int>(vec.iov_len)) {
+      tcp_tunnel_callbacks_.unwritable_streams_.emplace(stream_id_);
+      bufferevent_disable(bev_, EV_READ);
+      logger->trace(
+          "stream {} send buffer is full, remaining {} bytes, total unwritable "
+          "streams {}",
+          stream_id_, length - total_sent,
+          tcp_tunnel_callbacks_.unwritable_streams_.size());
+      break;
+    }
+
+    if (evbuffer_ptr_set(evb, &ptr, vec.iov_len, EVBUFFER_PTR_ADD) != 0) {
+      logger->error("evbuffer_ptr_set failed");
+      break;
+    }
+  }
+
+  evbuffer_drain(evb, total_sent);
+  sent_bytes_ += total_sent;
+  logger->trace("TCP->QUIC {} bytes, remaining {} bytes", total_sent,
+                length - total_sent);
+}
+
+void TcpTunnelCallbacks::StreamCallbacks::Close() {
+  if (tcp_tunnel_callbacks_.IsEstablished()) {
+    tcp_tunnel_callbacks_.connection().Close(stream_id_);
+  }
+
+  auto duration = std::chrono::steady_clock::now() - created_time_;
+  auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+  logger->info(
+      "close stream {}, lasting {} seconds, recv {} bytes, sent {} bytes, cid "
+      "{:spn}",
+      stream_id_, seconds.count(), recv_bytes_, sent_bytes_,
+      tcp_tunnel_callbacks_.HexId());
 }
 
 }  // namespace quic_tunnel

@@ -11,20 +11,8 @@ class ServerConnectionCallbacks : public TcpTunnelCallbacks {
  public:
   explicit ServerConnectionCallbacks(EventBase &base) : base_(base) {}
 
-  void OnConnected(Connection &connection) override {
-    connection_ = &connection;
-  }
-
  private:
-  bool IsEstablished() override {
-    return connection_ && connection_->IsEstablished();
-  }
-
-  Connection &connection() override { return *connection_; }
-
-  void OnQuicConnectionClosed() override { connection_ = nullptr; }
-
-  bufferevent *OnNewStream(StreamId stream_id) override {
+  bufferevent *OnNewStream() override {
     auto *bev = bufferevent_socket_new(
         base_.base(), -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
     assert(bev);
@@ -45,12 +33,11 @@ class ServerConnectionCallbacks : public TcpTunnelCallbacks {
       bufferevent_free(bev);
     }
 
-    NewStream(stream_id, bev);
     return bev;
   }
 
   Status OnTcpRead() override {
-    if (!connection_) {
+    if (!IsEstablished()) {
       logger->warn("QUIC connection accidentally closed");
       return TcpTunnelCallbacks::Status::kClosed;
     }
@@ -58,7 +45,6 @@ class ServerConnectionCallbacks : public TcpTunnelCallbacks {
   }
 
   EventBase &base_;
-  Connection *connection_{};
 };
 
 std::unique_ptr<ConnectionCallbacks> TcpTunnelServer::Create() {

@@ -29,6 +29,10 @@ class Connection : NonCopyable {
 
   [[nodiscard]] const ConnectionId &id() const noexcept { return id_; }
 
+  [[nodiscard]] auto PeerStreamsLeft() const noexcept {
+    return quiche_conn_peer_streams_left_bidi(conn_);
+  }
+
   int Accept(const ConnectionId &dcid, const ConnectionId &odcid,
              const ConnectionId &scid);
   int Connect();
@@ -36,6 +40,7 @@ class Connection : NonCopyable {
                bool fin);
   void Close();
   void Close(StreamId);
+  void ShutdownRead(StreamId);
   int OnRead(uint8_t *buf, size_t len, size_t size);
 
  private:

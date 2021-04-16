@@ -43,8 +43,12 @@ void Connection::Close() {
 }
 
 void Connection::Close(StreamId stream_id) {
-  quiche_conn_stream_shutdown(conn_, stream_id, QUICHE_SHUTDOWN_READ, 0);
+  ShutdownRead(stream_id);
   Send(stream_id, nullptr, 0, true);
+}
+
+void Connection::ShutdownRead(StreamId stream_id) {
+  quiche_conn_stream_shutdown(conn_, stream_id, QUICHE_SHUTDOWN_READ, 0);
 }
 
 int Connection::Accept(const ConnectionId &dcid, const ConnectionId &odcid,
@@ -105,6 +109,11 @@ int Connection::FlushEgress() {
 }
 
 int Connection::OnRead(uint8_t *buf, size_t len, size_t size) {
+  if (!conn_) {
+    logger->warn("recv data on closed connection {:spn}", HexId());
+    return -1;
+  }
+
   auto count = quiche_conn_recv(conn_, buf, len);
   if (count < 0) {
     logger->error("failed to process packet: {}, cid {:spn}", count, HexId());
