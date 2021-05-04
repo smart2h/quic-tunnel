@@ -8,6 +8,125 @@
 #include <utility>
 
 namespace quic_tunnel {
+namespace {
+
+class HttpRequestHostParser {
+ public:
+  explicit HttpRequestHostParser(evbuffer *evb) : evb_(evb){};
+
+  const char *Parse() {
+    const auto max_search_length =
+        std::min(evbuffer_get_length(evb_), sizeof(line_) * 2);
+    evbuffer_ptr search_end;
+    evbuffer_ptr_set(evb_, &search_end, 0, EVBUFFER_PTR_SET);
+    evbuffer_ptr_set(evb_, &search_end, max_search_length, EVBUFFER_PTR_ADD);
+    first_eol_ = evbuffer_search_range(evb_, "\n", 1, nullptr, &search_end);
+    if (first_eol_.pos == -1) {
+      return "";
+    }
+
+    const char *host = ParseFirstLine();
+    if (strlen(host) == 0) {
+      evbuffer_ptr_set(evb_, &first_eol_, 1, EVBUFFER_PTR_ADD);
+      second_eol_ =
+          evbuffer_search_range(evb_, "\n", 1, &first_eol_, &search_end);
+      if (second_eol_.pos != -1) {
+        host = ParseSecondLine();
+      }
+    }
+    return host;
+  }
+
+ private:
+  const char *ParseFirstLine() {
+    const char http[] = " HTTP/";
+    auto end = evbuffer_search_range(evb_, http, sizeof(http) - 1, nullptr,
+                                     &first_eol_);
+    if (end.pos == -1) {
+      return "";
+    }
+
+    auto begin = evbuffer_search_range(evb_, " ", 1, nullptr, &end);
+    if (begin.pos == -1) {
+      return "";
+    }
+
+    evbuffer_ptr_set(evb_, &begin, 1, EVBUFFER_PTR_ADD);
+    int len = end.pos - begin.pos;
+    if (len == 0 || len >= static_cast<int>(sizeof(line_) - 1)) {
+      return "";
+    }
+
+    len = evbuffer_copyout_from(evb_, &begin, line_, len);
+    if (len == -1) {
+      return "";
+    }
+
+    if (line_[0] == '/') {
+      return "";
+    }
+
+    line_[len] = '\0';
+    char *host = line_;
+    while (*host == ' ') {
+      ++host;
+    }
+
+    char *p = strstr(host, "://");
+    if (p) {
+      host = p + 3;
+    }
+
+    p = host;
+    while (*p && (*p != '/' && *p != ' ')) {
+      ++p;
+    }
+    *p = '\0';
+    return host;
+  }
+
+  const char *ParseSecondLine() {
+    int len = second_eol_.pos - first_eol_.pos;
+    if (len == 0 || len >= static_cast<int>(sizeof(line_) - 1)) {
+      return "";
+    }
+
+    len = evbuffer_copyout_from(evb_, &first_eol_, line_, len);
+    if (len == -1) {
+      return "";
+    }
+
+    line_[len] = '\0';
+    char *host = line_;
+    while (*host && *host != ':') {
+      ++host;
+    }
+
+    if (*host != ':' || host - line_ < 4 ||
+        strncasecmp(host - 4, "host", 4) != 0) {
+      return "";
+    }
+
+    ++host;
+    while (*host == ' ') {
+      ++host;
+    }
+
+    char *p = host;
+    while (*p && (*p != ' ' && *p != '\r')) {
+      ++p;
+    }
+    *p = '\0';
+    return host;
+  }
+
+  evbuffer *evb_;
+  evbuffer_ptr first_eol_;
+  evbuffer_ptr second_eol_;
+  char line_[80];
+};
+
+}  // namespace
 
 auto TcpTunnelCallbacks::HexId() { return spdlog::to_hex(connection().id()); }
 
@@ -152,10 +271,11 @@ TcpTunnelCallbacks::StreamCallbacks &TcpTunnelCallbacks::NewStream(
       std::piecewise_construct, std::forward_as_tuple(bev),
       std::forward_as_tuple(*this, stream_id, bev));
   stream_id_to_stream_callbacks_.emplace(stream_id, pair.first->second);
+  const auto &host = pair.first->second.host();
   logger->info(
-      "new stream {}, total streams {}, peer streams left {}, cid {:spn}",
-      stream_id, bev_to_stream_callbacks_.size(),
-      connection().PeerStreamsLeft(), HexId());
+      "new stream {}{}{}, total streams {}, peer streams left {}, cid {:spn}",
+      stream_id, host.empty() ? "" : " for ", host,
+      bev_to_stream_callbacks_.size(), connection().PeerStreamsLeft(), HexId());
   return pair.first->second;
 }
 
@@ -212,6 +332,19 @@ void TcpTunnelCallbacks::CloseOnStreamWriteFinished(bufferevent *bev) {
     }
   } else {
     Close(bev);
+  }
+}
+
+TcpTunnelCallbacks::StreamCallbacks::StreamCallbacks(
+    TcpTunnelCallbacks &callbacks, StreamId stream_id, bufferevent *bev)
+    : tcp_tunnel_callbacks_(callbacks),
+      stream_id_(stream_id),
+      bev_(bev),
+      created_time_(std::chrono::steady_clock::now()) {
+  const auto &cfg = AppConfig::GetInstance();
+  if (!cfg.is_server && cfg.protocol == "http") {
+    auto *evb = bufferevent_get_input(bev_);
+    host_ = HttpRequestHostParser(evb).Parse();
   }
 }
 
@@ -299,10 +432,10 @@ void TcpTunnelCallbacks::StreamCallbacks::Close() {
   auto duration = std::chrono::steady_clock::now() - created_time_;
   auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
   logger->info(
-      "close stream {}, lasting {} seconds, recv {} bytes, sent {} bytes, cid "
-      "{:spn}",
-      stream_id_, seconds.count(), recv_bytes_, sent_bytes_,
-      tcp_tunnel_callbacks_.HexId());
+      "close stream {}{}{}, lasting {} seconds, recv {} bytes, sent {} bytes, "
+      "cid {:spn}",
+      stream_id_, host_.empty() ? "" : " for ", host_, seconds.count(),
+      recv_bytes_, sent_bytes_, tcp_tunnel_callbacks_.HexId());
 }
 
 }  // namespace quic_tunnel

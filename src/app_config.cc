@@ -37,6 +37,7 @@ int AppConfig::Load(const std::string &path) {
 
     const auto &app = toml::find(table, "app");
     cfg.is_server = toml::find<bool>(app, "server_mode");
+    cfg.protocol = toml::find_or<std::string>(app, "protocol", "http");
     std::string_view ip = toml::find<std::string>(app, "bind_ip");
     auto port = toml::find<uint16_t>(app, "bind_port");
     if (ip.empty() || port == 0 ||

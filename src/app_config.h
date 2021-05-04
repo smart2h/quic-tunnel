@@ -11,12 +11,13 @@ namespace quic_tunnel {
 
 struct AppConfig : NonCopyable {
   bool is_server;
-  bool quic_debug_logging;
+  std::string protocol;
   sockaddr_storage bind_addr;
   sockaddr_storage peer_addr;
 
   uint32_t tcp_read_watermark;
 
+  bool quic_debug_logging;
   uint32_t idle_timeout;
   uint32_t initial_max_stream_data_bidi_local;
   uint32_t initial_max_stream_data_bidi_remote;

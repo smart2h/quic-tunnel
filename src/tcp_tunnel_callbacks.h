@@ -30,11 +30,7 @@ class TcpTunnelCallbacks : public ConnectionCallbacks, NonCopyable {
   class StreamCallbacks : NonCopyable {
    public:
     StreamCallbacks(TcpTunnelCallbacks &callbacks, StreamId stream_id,
-                    bufferevent *bev)
-        : tcp_tunnel_callbacks_(callbacks),
-          stream_id_(stream_id),
-          bev_(bev),
-          created_time_(std::chrono::steady_clock::now()) {}
+                    bufferevent *bev);
 
     void OnStreamRead(const uint8_t *buf, size_t len, bool finished);
     void OnStreamWrite();
@@ -42,6 +38,7 @@ class TcpTunnelCallbacks : public ConnectionCallbacks, NonCopyable {
     void Close();
 
     [[nodiscard]] auto stream_id() const noexcept { return stream_id_; }
+    [[nodiscard]] const auto &host() const noexcept { return host_; }
     void set_tcp_closed() noexcept {
       tcp_closed_ = true;
       tcp_tunnel_callbacks_.connection().ShutdownRead(stream_id_);
@@ -51,7 +48,8 @@ class TcpTunnelCallbacks : public ConnectionCallbacks, NonCopyable {
     TcpTunnelCallbacks &tcp_tunnel_callbacks_;
     const StreamId stream_id_;
     bufferevent *const bev_;
-    std::chrono::time_point<std::chrono::steady_clock> created_time_;
+    const std::chrono::time_point<std::chrono::steady_clock> created_time_;
+    std::string host_;
     size_t sent_bytes_{};
     size_t recv_bytes_{};
     bool tcp_closed_{};

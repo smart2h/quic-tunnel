@@ -27,9 +27,16 @@ QuicConfig::QuicConfig(const AppConfig &cfg)
     }
   }
 
-  uint8_t protos[] = "\x05hq-29";
+  uint8_t protos[32];
+  if (cfg.protocol.length() >= sizeof(protos)) {
+    logger->error("length of application protocol is too long");
+    return;
+  }
+
+  protos[0] = cfg.protocol.length();
+  memcpy(protos + 1, cfg.protocol.data(), cfg.protocol.length());
   if (quiche_config_set_application_protos(quiche_config.get(), protos,
-                                           sizeof(protos) - 1)) {
+                                           cfg.protocol.length() + 1)) {
     logger->error("failed to set application protocols");
     return;
   }
