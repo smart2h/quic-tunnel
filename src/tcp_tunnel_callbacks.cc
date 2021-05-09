@@ -7,6 +7,8 @@
 #include <tuple>
 #include <utility>
 
+#include "admin.h"
+
 namespace quic_tunnel {
 namespace {
 
@@ -128,22 +130,51 @@ class HttpRequestHostParser {
 
 }  // namespace
 
-auto TcpTunnelCallbacks::HexId() { return spdlog::to_hex(connection().id()); }
-
-void TcpTunnelCallbacks::OnConnected(Connection &connection) {
-  connection_ = &connection;
-  for (auto bev : waiting_bevs_) {
-    bufferevent_enable(bev, EV_READ);
-    ReadCallback(bev, this);
-  }
-  waiting_bevs_.clear();
+TcpTunnelCallbacks::TcpTunnelCallbacks(Admin &admin) : admin_(admin) {
+  admin_.Register(*this);
 }
 
-void TcpTunnelCallbacks::OnClosed() {
+TcpTunnelCallbacks::~TcpTunnelCallbacks() {
+  admin_.Unregister(*this);
+  if (IsEstablished()) {
+    Close();
+    OnClosed();
+  }
+}
+
+auto TcpTunnelCallbacks::HexId() { return spdlog::to_hex(connection().id()); }
+
+void TcpTunnelCallbacks::Stats(evbuffer *evb) const {
+  if (!IsEstablished()) {
+    return;
+  }
+
+  connection_->Stats(evb);
+  evbuffer_add_printf(evb, "total streams %lu, peer streams left %lu\n",
+                      bev_to_stream_callbacks_.size(),
+                      connection_->PeerStreamsLeft());
+  for (const auto &[_, stream] : bev_to_stream_callbacks_) {
+    evbuffer_add_printf(evb,
+                        "  stream: %lu\n    host: %s\n    duration: %ds\n"
+                        "    recv: %luB\n    sent: %luB\n",
+                        stream.stream_id(), stream.host().c_str(),
+                        stream.DurationSeconds(), stream.recv_bytes(),
+                        stream.sent_bytes());
+  }
+}
+
+void TcpTunnelCallbacks::Close() {
+  if (connection_) {
+    CloseStreams();
+    connection_->Close();
+  }
+}
+
+void TcpTunnelCallbacks::CloseStreams() {
   if (!bev_to_stream_callbacks_.empty()) {
     logger->info(
         "closing {} application connections since QUIC connection {:spn} "
-        "closed",
+        "closing/closed",
         bev_to_stream_callbacks_.size(), HexId());
     for (auto iter = bev_to_stream_callbacks_.cbegin();
          iter != bev_to_stream_callbacks_.cend();) {
@@ -152,9 +183,15 @@ void TcpTunnelCallbacks::OnClosed() {
       CloseOnTcpWriteFinished(bev);
     }
   }
-
-  waiting_bevs_.clear();
   unwritable_streams_.clear();
+}
+
+void TcpTunnelCallbacks::OnConnected(Connection &connection) {
+  connection_ = &connection;
+}
+
+void TcpTunnelCallbacks::OnClosed() {
+  CloseStreams();
   stream_id_generator_.Reset();
   connection_ = nullptr;
 }
@@ -207,17 +244,6 @@ void TcpTunnelCallbacks::ReadCallback(bufferevent *bev, void *ctx) {
   }
 
   auto *callbacks = static_cast<TcpTunnelCallbacks *>(ctx);
-  if (auto status = callbacks->OnTcpRead(); status == Status::kUnready) {
-    callbacks->waiting_bevs_.emplace(bev);
-    bufferevent_disable(bev, EV_READ);
-    logger->info("waiting for connected, waiting queue {}",
-                 callbacks->waiting_bevs_.size());
-    return;
-  } else if (status == Status::kClosed) {
-    callbacks->CloseOnTcpWriteFinished(bev);
-    return;
-  }
-
   if (const auto iter = callbacks->bev_to_stream_callbacks_.find(bev);
       iter == callbacks->bev_to_stream_callbacks_.end()) {
     if (callbacks->connection().PeerStreamsLeft() == 0) {
@@ -368,8 +394,8 @@ void TcpTunnelCallbacks::StreamCallbacks::OnStreamRead(const uint8_t *buf,
   }
 
   if (finished) {
-    logger->info("remote close stream {}, cid {:spn}", stream_id_,
-                 tcp_tunnel_callbacks_.HexId());
+    closed_ = true;
+    LogStats(true);
     tcp_tunnel_callbacks_.CloseOnTcpWriteFinished(bev_);
   }
 }
@@ -425,17 +451,29 @@ void TcpTunnelCallbacks::StreamCallbacks::OnTcpRead() {
 }
 
 void TcpTunnelCallbacks::StreamCallbacks::Close() {
+  if (closed_) {
+    return;
+  }
+
   if (tcp_tunnel_callbacks_.IsEstablished()) {
     tcp_tunnel_callbacks_.connection().Close(stream_id_);
   }
+  LogStats(false);
+}
 
+int TcpTunnelCallbacks::StreamCallbacks::DurationSeconds() const noexcept {
   auto duration = std::chrono::steady_clock::now() - created_time_;
   auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+  return seconds.count();
+}
+
+void TcpTunnelCallbacks::StreamCallbacks::LogStats(bool remote_closed) const {
   logger->info(
-      "close stream {}{}{}, lasting {} seconds, recv {} bytes, sent {} bytes, "
-      "cid {:spn}",
-      stream_id_, host_.empty() ? "" : " for ", host_, seconds.count(),
-      recv_bytes_, sent_bytes_, tcp_tunnel_callbacks_.HexId());
+      "{}close stream {}{}{}, lasting {} seconds, recv {} bytes, sent {} "
+      "bytes, cid {:spn}",
+      remote_closed ? "remote " : "", stream_id_, host_.empty() ? "" : " for ",
+      host_, DurationSeconds(), recv_bytes_, sent_bytes_,
+      tcp_tunnel_callbacks_.HexId());
 }
 
 }  // namespace quic_tunnel

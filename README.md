@@ -9,7 +9,7 @@ Only `TCP` is supported now.
 ## Install dependencies using package manager
 
 ```shell
-sudo apt install cmake clang libevent-dev libssl-dev libspdlog-dev
+sudo apt install cmake clang lld libevent-dev libssl-dev libspdlog-dev
 ```
 
 ## Build `quiche`

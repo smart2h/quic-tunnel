@@ -64,6 +64,7 @@ int QuicClient::UdpConnect() {
 
 void QuicClient::Close() {
   if (fd_ > 0) {
+    connection_->Close();
     if (close(fd_) != 0) {
       logger->error("close fd {} failed: {}", fd_, strerror(errno));
     }

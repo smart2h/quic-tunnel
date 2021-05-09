@@ -7,6 +7,10 @@ bind_port = 8080
 peer_ip = ""
 peer_port = 8080
 
+[admin]
+bind_ip = "127.0.0.1"
+bind_port = 9000
+
 [quic]
 idle_timeout = 3600 # seconds
 

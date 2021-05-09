@@ -46,6 +46,14 @@ class EventBase {
     return 0;
   }
 
+  int Exit() {
+    if (event_base_loopexit(base_.get(), nullptr) != 0) {
+      logger->error("failed to exit event loop");
+      return -1;
+    }
+    return 0;
+  }
+
  private:
   UniquePtr<event_base, event_base_free> base_;
 };

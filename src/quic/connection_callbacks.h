@@ -10,10 +10,10 @@ class ConnectionCallbacks {
  public:
   virtual ~ConnectionCallbacks() = default;
   virtual void OnConnected(Connection &) = 0;
-  virtual void OnClosed() = 0;
+  virtual void OnClosed(Connection &) = 0;
   virtual void OnStreamRead(StreamId, const uint8_t *, size_t, bool) = 0;
   virtual void OnStreamWrite(StreamId) = 0;
-  virtual bool ReportWritableStreams() = 0;
+  [[nodiscard]] virtual bool ReportWritableStreams() const = 0;
 };
 
 }  // namespace quic_tunnel

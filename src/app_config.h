@@ -15,6 +15,9 @@ struct AppConfig : NonCopyable {
   sockaddr_storage bind_addr;
   sockaddr_storage peer_addr;
 
+  std::string admin_bind_ip;
+  uint16_t admin_bind_port;
+
   uint32_t tcp_read_watermark;
 
   bool quic_debug_logging;

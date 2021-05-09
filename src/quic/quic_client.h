@@ -12,13 +12,13 @@ class QuicClient : NonCopyable {
   ~QuicClient() { Close(); }
 
   int Connect();
-  void Close();
 
-  Connection &connection() noexcept { return *connection_; }
+  Connection *connection() noexcept { return connection_.get(); }
 
  private:
-  int UdpConnect();
   static void ReadCallback(int, short, void *);
+  int UdpConnect();
+  void Close();
 
   const QuicConfig &quic_config_;
   EventBase &base_;

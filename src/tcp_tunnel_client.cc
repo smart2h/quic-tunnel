@@ -3,6 +3,23 @@
 #include <event2/bufferevent.h>
 
 namespace quic_tunnel {
+namespace {
+
+class ClientConnectionCallbacks : public TcpTunnelCallbacks {
+ public:
+  explicit ClientConnectionCallbacks(Admin &admin)
+      : TcpTunnelCallbacks(admin){};
+
+  void OnNewTcpConnection(bufferevent *bev) {
+    bufferevent_setcb(bev, ReadCallback, nullptr, EventCallback, this);
+    ReadCallback(bev, this);
+  }
+
+ private:
+  bufferevent *OnNewStream() override { return nullptr; };
+};
+
+}  // namespace
 
 int TcpTunnelClient::Bind(const AppConfig &cfg, EventBase &base) {
   if (quic_client_.Connect() != 0) {
@@ -22,23 +39,12 @@ int TcpTunnelClient::Bind(const AppConfig &cfg, EventBase &base) {
   return 0;
 }
 
-TcpTunnelCallbacks::Status TcpTunnelClient::OnTcpRead() {
-  if (quic_client_.connection().IsEstablished()) {
-    return TcpTunnelCallbacks::Status::kReady;
-  }
-
-  if (quic_client_.connection().IsClosed()) {
-    quic_client_.Connect();
-  }
-  return TcpTunnelCallbacks::Status::kUnready;
-}
-
 void TcpTunnelClient::AcceptCallback(evconnlistener *listener,
                                      evutil_socket_t fd, sockaddr *, int,
                                      void *ctx) {
   auto client = static_cast<TcpTunnelClient *>(ctx);
-  if (client->IsEstablished() &&
-      client->quic_client_.connection().PeerStreamsLeft() == 0) {
+  if (client->tcp_tunnel_callbacks_ &&
+      client->quic_client_.connection()->PeerStreamsLeft() == 0) {
     logger->warn("no peer streams left");
     evutil_closesocket(fd);
     return;
@@ -60,6 +66,60 @@ void TcpTunnelClient::AcceptCallback(evconnlistener *listener,
     logger->error("failed to enable buffer event");
     bufferevent_free(bev);
     evutil_closesocket(fd);
+  }
+}
+
+void TcpTunnelClient::ReadCallback(bufferevent *bev, void *ctx) {
+  auto *client = static_cast<TcpTunnelClient *>(ctx);
+  if (client->tcp_tunnel_callbacks_) {
+    dynamic_cast<ClientConnectionCallbacks *>(
+        client->tcp_tunnel_callbacks_.get())
+        ->OnNewTcpConnection(bev);
+  } else {
+    if (!client->quic_client_.connection() ||
+        client->quic_client_.connection()->IsClosed()) {
+      if (client->quic_client_.Connect() != 0) {
+        bufferevent_free(bev);
+        return;
+      }
+    }
+
+    client->waiting_bevs_.emplace(bev);
+    bufferevent_disable(bev, EV_READ);
+    logger->info("waiting for connected, waiting queue {}",
+                 client->waiting_bevs_.size());
+  }
+}
+
+void TcpTunnelClient::EventCallback(bufferevent *bev, short what, void *) {
+  if (what & BEV_EVENT_ERROR) {
+    logger->warn("buffer event socket error: {}", strerror(errno));
+  }
+
+  if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+    bufferevent_free(bev);
+  } else {
+    logger->warn("invalid events: {}", static_cast<int>(what));
+  }
+}
+
+void TcpTunnelClient::OnConnected(Connection &connection) {
+  auto callbacks = std::make_unique<ClientConnectionCallbacks>(admin_);
+  static_cast<ConnectionCallbacks *>(callbacks.get())->OnConnected(connection);
+  for (auto iter = waiting_bevs_.cbegin(); iter != waiting_bevs_.cend();) {
+    bufferevent_enable(*iter, EV_READ);
+    callbacks->OnNewTcpConnection(*iter);
+    iter = waiting_bevs_.erase(iter);
+  }
+  tcp_tunnel_callbacks_ = std::move(callbacks);
+  connection.AddConnectionCallbacks(*tcp_tunnel_callbacks_);
+}
+
+void TcpTunnelClient::OnClosed() {
+  tcp_tunnel_callbacks_.reset();
+  for (auto iter = waiting_bevs_.cbegin(); iter != waiting_bevs_.cend();) {
+    bufferevent_free(*iter);
+    iter = waiting_bevs_.erase(iter);
   }
 }
 

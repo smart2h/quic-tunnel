@@ -1,6 +1,7 @@
 #include <csignal>
 #include <iostream>
 
+#include "admin.h"
 #include "tcp_tunnel_client.h"
 #include "tcp_tunnel_server.h"
 using namespace quic_tunnel;
@@ -55,14 +56,19 @@ int main(int argc, char **argv) {
   }
 
   EventBase base;
+  Admin admin(base);
+  if (admin.Bind() != 0) {
+    return -1;
+  }
+
   if (cfg.is_server) {
-    TcpTunnelServer server(quic_config, base);
+    TcpTunnelServer server(quic_config, base, admin);
     if (server.Bind() != 0) {
       return -1;
     }
     return base.Dispatch();
   } else {
-    TcpTunnelClient client(quic_config, base);
+    TcpTunnelClient client(quic_config, base, admin);
     if (client.Bind(cfg, base)) {
       return -1;
     }

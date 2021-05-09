@@ -1,8 +1,10 @@
 #ifndef QUIC_TUNNEL_QUIC_CONNECTION_H_
 #define QUIC_TUNNEL_QUIC_CONNECTION_H_
 
+#include <event2/buffer.h>
 #include <quiche.h>
 
+#include <list>
 #include <memory>
 
 #include "event/event_base.h"
@@ -17,7 +19,7 @@ class Connection : NonCopyable {
   Connection(const QuicConfig &quic_config, EventBase &base, int fd,
              ConnectionCallbacks &connection_callbacks,
              const sockaddr_storage &peer_addr);
-  ~Connection() { Close(); }
+  ~Connection();
 
   [[nodiscard]] bool IsClosed() const {
     return !conn_ || quiche_conn_is_closed(conn_);
@@ -33,6 +35,7 @@ class Connection : NonCopyable {
     return quiche_conn_peer_streams_left_bidi(conn_);
   }
 
+  void AddConnectionCallbacks(ConnectionCallbacks &callbacks);
   int Accept(const ConnectionId &dcid, const ConnectionId &odcid,
              const ConnectionId &scid);
   int Connect();
@@ -42,12 +45,16 @@ class Connection : NonCopyable {
   void Close(StreamId);
   void ShutdownRead(StreamId);
   int OnRead(uint8_t *buf, size_t len, size_t size);
+  void Stats(evbuffer *) const;
 
  private:
   void OnStreamRead(StreamId stream_id, uint8_t *buf, size_t size);
+  void OnStreamRead(StreamId, const uint8_t *, size_t, bool);
   int FlushEgress();
   void OnTimeout();
-  void Stats();
+  void OnConnected();
+  void OnClosed();
+  void Stats() const;
   void ReportWritableStreams();
   [[nodiscard]] auto HexId() const;
 
@@ -57,7 +64,7 @@ class Connection : NonCopyable {
   const int fd_;
   Timer timer_;
   quiche_conn *conn_;
-  ConnectionCallbacks &connection_callbacks_;
+  std::list<ConnectionCallbacks *> callbacks_;
   ConnectionId id_;
   const sockaddr_storage peer_addr_;
 };

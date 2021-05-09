@@ -2,6 +2,8 @@
 
 #include <spdlog/fmt/bin_to_hex.h>
 
+#include <algorithm>
+
 #include "log.h"
 #include "quic/quic_header.h"
 #include "util.h"
@@ -19,26 +21,31 @@ Connection::Connection(const QuicConfig &quic_config, EventBase &base, int fd,
           },
           this)),
       conn_(nullptr),
-      connection_callbacks_(connection_callbacks),
       id_(),
-      peer_addr_(peer_addr) {}
+      peer_addr_(peer_addr) {
+  callbacks_.emplace_back(&connection_callbacks);
+}
+
+Connection::~Connection() {
+  if (conn_) {
+    Close();
+    OnClosed();
+  }
+}
 
 auto Connection::HexId() const { return spdlog::to_hex(id_); }
 
 void Connection::Close() {
   if (conn_) {
     if (!IsClosed()) {
+      logger->info("closing QUIC connection {:spn}", HexId());
       if (auto r = quiche_conn_close(conn_, true, 0, nullptr, 0); r != 0) {
         logger->error("failed to close QUIC connection {:spn}, error {}",
                       HexId(), r);
+      } else {
+        FlushEgress();
       }
     }
-
-    Stats();
-    quiche_conn_free(conn_);
-    conn_ = nullptr;
-    timer_.Disable();
-    connection_callbacks_.OnClosed();
   }
 }
 
@@ -49,6 +56,10 @@ void Connection::Close(StreamId stream_id) {
 
 void Connection::ShutdownRead(StreamId stream_id) {
   quiche_conn_stream_shutdown(conn_, stream_id, QUICHE_SHUTDOWN_READ, 0);
+}
+
+void Connection::AddConnectionCallbacks(ConnectionCallbacks &callbacks) {
+  callbacks_.emplace_back(&callbacks);
 }
 
 int Connection::Accept(const ConnectionId &dcid, const ConnectionId &odcid,
@@ -124,7 +135,7 @@ int Connection::OnRead(uint8_t *buf, size_t len, size_t size) {
     if (!connected_) {
       connected_ = true;
       logger->info("QUIC connected, cid {:spn}", HexId());
-      connection_callbacks_.OnConnected(*this);
+      OnConnected();
     }
 
     auto stream_iter = quiche_conn_readable(conn_);
@@ -154,25 +165,60 @@ void Connection::OnStreamRead(StreamId stream_id, uint8_t *buf, size_t size) {
     } else {
       logger->trace("stream {} recv {} bytes, cid {:spn}", stream_id, count,
                     HexId());
-      connection_callbacks_.OnStreamRead(stream_id, buf, count, finished);
+      OnStreamRead(stream_id, buf, count, finished);
     }
   } while (!(static_cast<size_t>(count) < size || finished));
+}
+
+void Connection::OnStreamRead(StreamId stream_id, const uint8_t *buf,
+                              size_t count, bool finished) {
+  for (auto *callbacks : callbacks_) {
+    callbacks->OnStreamRead(stream_id, buf, count, finished);
+  }
 }
 
 void Connection::OnTimeout() {
   quiche_conn_on_timeout(conn_);
   FlushEgress();
   if (IsClosed()) {
-    Close();
+    OnClosed();
   }
 }
 
-void Connection::Stats() {
+void Connection::OnConnected() {
+  for (auto *callbacks : callbacks_) {
+    callbacks->OnConnected(*this);
+  }
+}
+
+void Connection::OnClosed() {
+  std::for_each(callbacks_.crbegin(), callbacks_.crend(),
+                [this](auto *callbacks) { callbacks->OnClosed(*this); });
+  Stats();
+  quiche_conn_free(conn_);
+  conn_ = nullptr;
+  timer_.Disable();
+}
+
+void Connection::Stats() const {
   quiche_stats stats;
   quiche_conn_stats(conn_, &stats);
   logger->info(
-      "QUIC connection {:spn} closed, recv={} sent={} lost={} rtt={}ns cwnd={}",
-      HexId(), stats.recv, stats.sent, stats.lost, stats.rtt, stats.cwnd);
+      "QUIC connection {:spn} closed, recv={} sent={} lost={} rtt={}ns cwnd={} "
+      "delivery_rate={}bytes/s",
+      HexId(), stats.recv, stats.sent, stats.lost, stats.rtt, stats.cwnd,
+      stats.delivery_rate);
+}
+
+void Connection::Stats(evbuffer *evb) const {
+  quiche_stats stats;
+  quiche_conn_stats(conn_, &stats);
+  auto *end = fmt::format_to(udp_buffer,
+                             "connection {:spn} recv={} sent={} lost={} "
+                             "rtt={}ns cwnd={} dilivery_rate={}bytes/s\n",
+                             HexId(), stats.recv, stats.sent, stats.lost,
+                             stats.rtt, stats.cwnd, stats.delivery_rate);
+  evbuffer_add(evb, udp_buffer, end - udp_buffer);
 }
 
 ssize_t Connection::Send(StreamId stream_id, const uint8_t *buf, size_t buf_len,
@@ -194,15 +240,23 @@ ssize_t Connection::Send(StreamId stream_id, const uint8_t *buf, size_t buf_len,
 }
 
 void Connection::ReportWritableStreams() {
-  if (connection_callbacks_.ReportWritableStreams()) {
-    auto stream_iter = quiche_conn_writable(conn_);
-    for (StreamId stream_id;
-         quiche_stream_iter_next(stream_iter, &stream_id);) {
-      logger->trace("stream {} is writable, cid {:spn}", stream_id, HexId());
-      connection_callbacks_.OnStreamWrite(stream_id);
-    }
-    quiche_stream_iter_free(stream_iter);
+  bool report_writable_streams = std::any_of(
+      callbacks_.cbegin(), callbacks_.cend(),
+      [](const auto *callbacks) { return callbacks->ReportWritableStreams(); });
+  if (!report_writable_streams) {
+    return;
   }
+
+  auto stream_iter = quiche_conn_writable(conn_);
+  for (StreamId stream_id; quiche_stream_iter_next(stream_iter, &stream_id);) {
+    logger->trace("stream {} is writable, cid {:spn}", stream_id, HexId());
+    for (auto *callbacks : callbacks_) {
+      if (callbacks->ReportWritableStreams()) {
+        callbacks->OnStreamWrite(stream_id);
+      }
+    }
+  }
+  quiche_stream_iter_free(stream_iter);
 }
 
 }  // namespace quic_tunnel

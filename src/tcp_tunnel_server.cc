@@ -7,9 +7,12 @@
 
 namespace quic_tunnel {
 
+namespace {
+
 class ServerConnectionCallbacks : public TcpTunnelCallbacks {
  public:
-  explicit ServerConnectionCallbacks(EventBase &base) : base_(base) {}
+  ServerConnectionCallbacks(EventBase &base, Admin &admin)
+      : TcpTunnelCallbacks(admin), base_(base) {}
 
  private:
   bufferevent *OnNewStream() override {
@@ -36,19 +39,13 @@ class ServerConnectionCallbacks : public TcpTunnelCallbacks {
     return bev;
   }
 
-  Status OnTcpRead() override {
-    if (!IsEstablished()) {
-      logger->warn("QUIC connection accidentally closed");
-      return TcpTunnelCallbacks::Status::kClosed;
-    }
-    return TcpTunnelCallbacks::Status::kReady;
-  }
-
   EventBase &base_;
 };
 
+}  // namespace
+
 std::unique_ptr<ConnectionCallbacks> TcpTunnelServer::Create() {
-  return std::make_unique<ServerConnectionCallbacks>(base_);
+  return std::make_unique<ServerConnectionCallbacks>(base_, admin_);
 }
 
 }  // namespace quic_tunnel

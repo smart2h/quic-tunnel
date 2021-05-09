@@ -8,10 +8,11 @@
 
 namespace quic_tunnel {
 
+class Admin;
 class TcpTunnelServer : NonCopyable, ConnectionCallbacksFactory {
  public:
-  TcpTunnelServer(const QuicConfig &quic_config, EventBase &base)
-      : base_(base), quic_server_(quic_config, base, *this) {}
+  TcpTunnelServer(const QuicConfig &quic_config, EventBase &base, Admin &admin)
+      : base_(base), admin_(admin), quic_server_(quic_config, base, *this) {}
 
   int Bind() { return quic_server_.Bind(); }
 
@@ -19,6 +20,7 @@ class TcpTunnelServer : NonCopyable, ConnectionCallbacksFactory {
 
  private:
   EventBase &base_;
+  Admin &admin_;
   QuicServer quic_server_;
 };
 

@@ -54,6 +54,11 @@ int AppConfig::Load(const std::string &path) {
       return -1;
     }
 
+    const auto &admin = toml::find(table, "admin");
+    cfg.admin_bind_ip =
+        toml::find_or<std::string>(admin, "bind_ip", "127.0.0.1");
+    cfg.admin_bind_port = toml::find<uint16_t>(admin, "bind_port");
+
     cfg.tcp_read_watermark = 1024 * 1024;
     if (table.contains("tcp")) {
       const auto &tcp = table["tcp"];

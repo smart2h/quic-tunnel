@@ -9,6 +9,8 @@ find_package(toml11 3.6.0 REQUIRED)
 
 add_executable(
   quic-tunnel
+  src/admin.cc
+  src/admin.h
   src/app_config.cc
   src/app_config.h
   src/event/event.h
@@ -45,4 +47,6 @@ target_include_directories(quic-tunnel PRIVATE src)
 target_compile_options(quic-tunnel PRIVATE -Wall -Wextra -pedantic -Weffc++
                                            -Werror)
 
-target_link_libraries(quic-tunnel quiche event_core pthread dl)
+target_link_options(quic-tunnel PRIVATE -fuse-ld=lld -L/usr/local/lib)
+
+target_link_libraries(quic-tunnel quiche event_extra event_core pthread dl)

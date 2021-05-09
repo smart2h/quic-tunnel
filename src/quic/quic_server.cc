@@ -52,7 +52,12 @@ QuicServer::QuicServer(const QuicConfig &quic_config, EventBase &base,
     : quic_config_(quic_config),
       base_(base),
       connection_callbacks_factory_(connection_callbacks_factory),
-      fd_(0) {}
+      fd_(0),
+      timer_(base_.NewTimer(
+          [](int, short, void *arg) {
+            static_cast<QuicServer *>(arg)->RemoveClosedConnections();
+          },
+          this)) {}
 
 int QuicServer::Bind() {
   fd_ = socket(AF_INET, SOCK_DGRAM, 0);
@@ -120,9 +125,10 @@ auto QuicServer::Handshake(QuicHeader &header,
     return connections_.end();
   }
 
+  auto connection =
+      std::make_unique<Connection>(quic_config_, base_, fd, *this, peer_addr);
   auto connection_callbacks = connection_callbacks_factory_.Create();
-  auto connection = std::make_unique<Connection>(
-      quic_config_, base_, fd, *connection_callbacks, peer_addr);
+  connection->AddConnectionCallbacks(*connection_callbacks);
   if (connection->Accept(header.dcid, odcid, header.scid) != 0) {
     return connections_.end();
   }
@@ -132,6 +138,19 @@ auto QuicServer::Handshake(QuicHeader &header,
       conn_id,
       std::make_pair(std::move(connection), std::move(connection_callbacks)));
   return pair.first;
+}
+
+void QuicServer::OnClosed(Connection &connection) {
+  closed_connection_ids_.emplace_back(connection.id());
+  timer_.Enable(0);
+}
+
+void QuicServer::RemoveClosedConnections() {
+  for (auto iter = closed_connection_ids_.cbegin();
+       iter != closed_connection_ids_.cend();) {
+    connections_.erase(*iter);
+    iter = closed_connection_ids_.erase(iter);
+  }
 }
 
 void QuicServer::ReadCallback(int fd, short, void *arg) {
